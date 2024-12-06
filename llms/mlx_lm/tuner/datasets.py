@@ -84,9 +84,6 @@ class CompletionsDataset(Dataset):
         )
         return text
 
-    def get_prompt_and_completion(self, idx: int):
-        return self._data[idx][self._prompt_key], self._data[idx][self._completion_key]
-
 
 class CompletionsDatasetCollection:
     def __init__(self, data: List[Union[ChatDataset, CompletionsDataset]]):

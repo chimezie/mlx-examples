@@ -61,7 +61,6 @@ class CompletionsDataset(Dataset):
         self,
         data: List[Dict[str, str]],
         tokenizer: PreTrainedTokenizer,
-        response_template: Union[str, list[int]] = None,
         prompt_key: str = "prompt",
         completion_key: str = "completion",
     ):
@@ -69,12 +68,6 @@ class CompletionsDataset(Dataset):
         self._tokenizer = tokenizer
         self._prompt_key = prompt_key
         self._completion_key = completion_key
-        if isinstance(response_template, str):
-            self.response_token_ids = self._tokenizer.encode(
-                response_template, add_special_tokens=False
-            )
-        else:
-            self.response_token_ids = response_template
 
     def get_prompt_and_completion(self, idx: int):
         return self._data[idx][self._prompt_key], self._data[idx][self._completion_key]

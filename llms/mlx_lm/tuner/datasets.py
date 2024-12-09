@@ -74,9 +74,13 @@ class CompletionsDataset(Dataset):
 
     def get_item(
         self, idx: int, tokenize: bool = False, add_generation_prompt: bool = True
-    ):
+    ) -> str:
+        prompt, completion = self.get_prompt_and_completion(idx)
         return self._tokenizer.apply_chat_template(
-            self._data[idx],
+            [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": completion},
+            ],
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
         )
@@ -117,6 +121,14 @@ class CompletionsDatasetCollection:
     def __getitem__(self, idx: int):
         def getitem(dataset: CompletionsDataset, index: int):
             return dataset[index]
+
+        return self.__fetch_and_process_item__(idx, getitem)
+
+    def get_item(
+        self, idx: int, tokenize: bool = False, add_generation_prompt: bool = True
+    ) -> str:
+        def getitem(dataset: CompletionsDataset, index: int):
+            return dataset.get_item(index, tokenize, add_generation_prompt)
 
         return self.__fetch_and_process_item__(idx, getitem)
 

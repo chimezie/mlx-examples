@@ -4,8 +4,6 @@ from typing import List
 
 from transformers import AutoTokenizer
 
-REPLACEMENT_CHAR = "\ufffd"
-
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -52,11 +50,9 @@ class StreamingDetokenizer:
     def last_segment(self):
         """Return the last segment of readable text since last time this property was accessed."""
         text = self.text
-        if text and text[-1] != REPLACEMENT_CHAR:
-            segment = text[self.offset :]
-            self.offset = len(text)
-            return segment
-        return ""
+        segment = text[self.offset :]
+        self.offset = len(text)
+        return segment
 
 
 class NaiveStreamingDetokenizer(StreamingDetokenizer):
@@ -133,7 +129,7 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self.tokens = []
 
     def _flush(self):
-        text = self._unflushed.replace(self._sep, b" ").decode("utf-8")
+        text = self._unflushed.replace(self._sep, b" ").decode("utf-8", "replace")
         if not self.text and self.trim_space and text and text[0] == " ":
             text = text[1:]
         self.text += text
@@ -200,22 +196,21 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self.tokens.append(token)
         v = self.tokenmap[token]
         is_added = token in self._added_ids
-        if is_added or self._byte_decoder[v[0]] == 32:
-            current_text = bytearray(
-                self._byte_decoder[c] for c in self._unflushed
-            ).decode("utf-8")
-            self.text += self._maybe_trim_space(current_text)
-            if is_added:
-                self.text += v
-                self._unflushed = ""
-            else:
-                self._unflushed = v
-        else:
+        if not is_added:
             self._unflushed += v
+        text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
+            "utf-8", "replace"
+        )
+        if is_added:
+            text += v
+        if not text.endswith("\ufffd"):
+            self.text += self._maybe_trim_space(text)
+            self._unflushed = ""
 
     def finalize(self):
         current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
-            "utf-8"
+            "utf-8",
+            "replace",
         )
         self.text += self._maybe_trim_space(current_text)
         self._unflushed = ""
@@ -255,21 +250,33 @@ class TokenizerWrapper:
     huggingface tokenizer.
     """
 
-    def __init__(self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer):
+    def __init__(
+        self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer, eos_token_ids=None
+    ):
         self._tokenizer = tokenizer
         self._detokenizer = detokenizer_class(tokenizer)
+        self._eos_token_ids = (
+            set(eos_token_ids)
+            if eos_token_ids is not None
+            else {tokenizer.eos_token_id}
+        )
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
             return self._detokenizer
+        elif attr == "eos_token_ids":
+            return self._eos_token_ids
         elif attr.startswith("_"):
             return self.__getattribute__(attr)
         else:
             return getattr(self._tokenizer, attr)
 
     def __setattr__(self, attr, value):
-        if attr == "detokenizer":
-            raise AttributeError("Cannot set the detokenizer.")
+        if attr in {"detokenizer", "eos_token_ids"}:
+            if attr == "detokenizer":
+                raise AttributeError("Cannot set the detokenizer.")
+            elif attr == "eos_token_ids":
+                self._eos_token_ids = set(value) if value is not None else set()
         elif attr.startswith("_"):
             super().__setattr__(attr, value)
         else:
@@ -316,7 +323,7 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}):
+def load_tokenizer(model_path, tokenizer_config_extra={}, eos_token_ids=None):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
@@ -337,9 +344,12 @@ def load_tokenizer(model_path, tokenizer_config_extra={}):
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = BPEStreamingDetokenizer
 
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
     return TokenizerWrapper(
         AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
         detokenizer_class,
+        eos_token_ids=eos_token_ids,
     )
 
 

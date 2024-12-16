@@ -24,7 +24,7 @@ from .models import cache
 from .sample_utils import make_logits_processors, make_sampler
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import load_adapters
+from .tuner.utils import load_adapters, nparams
 
 # Constants
 MODEL_REMAPPING = {
@@ -59,6 +59,7 @@ class GenerationResponse:
         generation_tokens (int): The number of generated tokens.
         generation_tps (float): The tokens-per-second for generation.
         peak_memory (float): The peak memory used so far in GB.
+        finish_reason (str): The reason the response is being sent: "length", "stop" or `None`
     """
 
     text: str
@@ -69,6 +70,7 @@ class GenerationResponse:
     generation_tokens: int
     generation_tps: float
     peak_memory: float
+    finish_reason: Optional[str] = None
 
 
 @contextlib.contextmanager
@@ -125,6 +127,17 @@ def _get_classes(config: dict):
         raise ValueError(msg)
 
     return arch.Model, arch.ModelArgs
+
+
+def compute_bits_per_weight(model):
+    model_bytes = tree_reduce(
+        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
+    )
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+    model_params = sum(nparams(m) for _, m in leaf_modules)
+    return model_bytes * 8 / model_params
 
 
 def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
@@ -286,6 +299,9 @@ def generate_step(
         prompt_processed_tokens = 0
         while y.size > prefill_step_size:
             model(y[:prefill_step_size][None], cache=prompt_cache)
+            maybe_quantize_kv_cache(
+                prompt_cache, quantized_kv_start, kv_group_size, kv_bits
+            )
             mx.eval([c.state for c in prompt_cache])
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt_processed_tokens += prefill_step_size
@@ -350,7 +366,7 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
-            if token == tokenizer.eos_token_id:
+            if token in tokenizer.eos_token_ids:
                 break
 
             detokenizer.add_token(token)
@@ -364,6 +380,7 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.metal.get_peak_memory() / 1e9,
+                finish_reason=None,
             )
 
         detokenizer.finalize()
@@ -376,6 +393,7 @@ def stream_generate(
             generation_tokens=n + 1,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
         )
 
 
@@ -456,11 +474,11 @@ def load_model(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
-        model_config (dict, optional): Configuration parameters for the model.
-            Defaults to an empty dictionary.
+        model_config (dict, optional): Optional configuration parameters for the
+            model. Defaults to an empty dictionary.
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
-            Defaults to the _get_classes function.
+            Defaults to the ``_get_classes`` function.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -469,7 +487,6 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-
     config = load_config(model_path)
     config.update(model_config)
 
@@ -496,15 +513,20 @@ def load_model(
         weights = model.sanitize(weights)
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may not have everything quantized
+
         def class_predicate(p, m):
+            # Handle custom per layer quantizations
+            if p in config["quantization"]:
+                return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
+            # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
         nn.quantize(
             model,
-            **quantization,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
             class_predicate=class_predicate,
         )
 
@@ -514,7 +536,7 @@ def load_model(
         mx.eval(model.parameters())
 
     model.eval()
-    return model
+    return model, config
 
 
 def load(
@@ -547,11 +569,13 @@ def load(
     """
     model_path = get_model_path(path_or_hf_repo)
 
-    model = load_model(model_path, lazy, model_config)
+    model, config = load_model(model_path, lazy)
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
-    tokenizer = load_tokenizer(model_path, tokenizer_config)
+    tokenizer = load_tokenizer(
+        model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
+    )
 
     return model, tokenizer
 
@@ -559,9 +583,10 @@ def load(
 def fetch_from_hub(
     model_path: Path, lazy: bool = False
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model = load_model(model_path, lazy)
-    config = load_config(model_path)
-    tokenizer = load_tokenizer(model_path)
+    model, config = load_model(model_path, lazy)
+    tokenizer = load_tokenizer(
+        model_path, eos_token_ids=config.get("eos_token_id", None)
+    )
     return model, config, tokenizer
 
 
@@ -707,7 +732,13 @@ def save_weights(
 
 
 def quantize_model(
-    model: nn.Module, config: dict, q_group_size: int, q_bits: int
+    model: nn.Module,
+    config: dict,
+    q_group_size: int,
+    q_bits: int,
+    quant_predicate: Optional[
+        Callable[[str, nn.Module, dict], Union[bool, dict]]
+    ] = None,
 ) -> Tuple:
     """
     Applies quantization to the model weights.
@@ -717,16 +748,36 @@ def quantize_model(
         config (dict): Model configuration.
         q_group_size (int): Group size for quantization.
         q_bits (int): Bits per weight for quantization.
+        quant_predicate (Callable): A callable that decides how
+            to quantize each layer based on the path.
+            Accepts the layer `path`, the `module` and the model `config`.
+            Returns either a bool to signify quantize/no quantize or
+            a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
         Tuple: Tuple containing quantized weights and config.
     """
     quantized_config = copy.deepcopy(config)
-    nn.quantize(model, q_group_size, q_bits)
     quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+
+    # Add any custom quantization parameters to the config as we go
+    def _class_predicate(p, m):
+        bool_or_params = quant_predicate(p, m, config)
+        quantized_config["quantization"][p] = bool_or_params
+        return bool_or_params
+
+    nn.quantize(
+        model,
+        q_group_size,
+        q_bits,
+        class_predicate=_class_predicate if quant_predicate else None,
+    )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
     quantized_weights = dict(tree_flatten(model.parameters()))
+
+    bpw = compute_bits_per_weight(model)
+    print(f"[INFO] Quantized model with {bpw:.3f} bits per weight.")
 
     return quantized_weights, quantized_config
 
@@ -764,6 +815,9 @@ def convert(
     upload_repo: str = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
+    quant_predicate: Optional[
+        Callable[[str, nn.Module, dict], Union[bool, dict]]
+    ] = None,
 ):
     # Check the save path is empty
     if isinstance(mlx_path, str):
@@ -789,7 +843,9 @@ def convert(
     if quantize:
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
-        weights, config = quantize_model(model, config, q_group_size, q_bits)
+        weights, config = quantize_model(
+            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
+        )
 
     if dequantize:
         print("[INFO] Dequantizing")

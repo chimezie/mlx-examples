@@ -7,7 +7,7 @@ import mlx.core as mx
 
 
 class FluxSampler:
-    def __init__(self, name: str, base_shift: float = 0.5, max_shift: float = 1.5):
+    def __init__(self, name: str, base_shift: float = 0.5, max_shift: float = 1.15):
         self._base_shift = base_shift
         self._max_shift = max_shift
         self._schnell = "schnell" in name
@@ -50,6 +50,7 @@ class FluxSampler:
             if noise is not None
             else mx.random.normal(x.shape, dtype=x.dtype, key=key)
         )
+        t = t.reshape([-1] + [1] * (x.ndim - 1))
         return x * (1 - t) + t * noise
 
     def step(self, pred, x_t, t, t_prev):
